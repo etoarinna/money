@@ -5,10 +5,26 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import warnings
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 warnings.filterwarnings("ignore", message="If 'per_message=False'")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass
+
+
+def run_health_server():
+    HTTPServer(("0.0.0.0", 8080), HealthHandler).serve_forever()
 
 from telegram import (
     InlineKeyboardButton,
@@ -813,6 +829,7 @@ def main() -> None:
     )
     app.add_handler(conv)
 
+    threading.Thread(target=run_health_server, daemon=True).start()
     logger.info("Bot is running…")
     app.run_polling(drop_pending_updates=True)
 
