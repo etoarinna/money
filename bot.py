@@ -7,8 +7,9 @@ import re
 import tempfile
 import threading
 import warnings
-from datetime import date, timedelta
+from datetime import date, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
 
 warnings.filterwarnings("ignore", message="If 'per_message=False'")
 
@@ -74,6 +75,15 @@ logger = logging.getLogger(__name__)
 ) = range(10)
 
 sheets_mgr: SheetsManager
+
+TYUMEN_TZ = ZoneInfo("Asia/Yekaterinburg")  # UTC+5
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_message(
+        chat_id=context.job.data,
+        text="💸 Внеси расходы!!!!",
+    )
 
 # ── Постоянная клавиатура ─────────────────────────────────────────────────────
 
@@ -828,6 +838,15 @@ def main() -> None:
         allow_reentry=True,
     )
     app.add_handler(conv)
+
+    if config.TELEGRAM_CHAT_ID and app.job_queue:
+        app.job_queue.run_daily(
+            send_reminder,
+            time=dt_time(21, 0, tzinfo=TYUMEN_TZ),
+            name="reminder",
+            data=int(config.TELEGRAM_CHAT_ID),
+        )
+        logger.info("Reminder scheduled at 21:00 Tyumen time")
 
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info("Bot is running…")
