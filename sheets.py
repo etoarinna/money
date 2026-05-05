@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 import gspread
@@ -9,6 +10,25 @@ from google.oauth2.service_account import Credentials
 import config
 
 logger = logging.getLogger(__name__)
+
+
+class _TTLCache:
+    def __init__(self, ttl: int = 60) -> None:
+        self._data: dict[str, tuple] = {}
+        self._ttl = ttl
+
+    def get(self, key: str):
+        entry = self._data.get(key)
+        if entry and time.time() - entry[1] < self._ttl:
+            return entry[0], True
+        return None, False
+
+    def set(self, key: str, value) -> None:
+        self._data[key] = (value, time.time())
+
+    def invalidate(self) -> None:
+        self._data.clear()
+
 
 _SHEETS_EPOCH = date(1899, 12, 30)
 
@@ -52,13 +72,10 @@ EXPENSE_CATEGORIES = [
     "Прочее",
 ]
 
-# Список учениц (редактировать здесь)
 STUDENTS: list[str] = [
     "Ира", "Катя", "Маша", "Тина", "Света", "Надя", "Соня",
 ]
 
-# Начальные балансы кошельков: (название, нач.баланс, годовая_ставка_%, банк)
-# Ставка 0.0 = обычный счёт без процентов
 INITIAL_WALLETS: list[tuple[str, float, float, str]] = [
     ("Сбербанк",           7331.47,  0.0, "Сбербанк"),
     ("Фонд накопительный", 4682.79,  0.0, "Сбербанк"),
@@ -76,6 +93,7 @@ class SheetsManager:
         )
         self.client = gspread.authorize(creds)
         self.spreadsheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
+        self._cache = _TTLCache(60)
         self._ensure_sheets()
 
     # ── Sheet initialisation ──────────────────────────────────────────────────
@@ -83,7 +101,6 @@ class SheetsManager:
     def _ensure_sheets(self) -> None:
         existing = {ws.title for ws in self.spreadsheet.worksheets()}
 
-        # ── Транзакции ──
         if TRANSACTIONS_SHEET not in existing:
             ws = self.spreadsheet.add_worksheet(
                 title=TRANSACTIONS_SHEET, rows=10000, cols=7
@@ -93,18 +110,15 @@ class SheetsManager:
                                 "backgroundColor": {"red": 0.18, "green": 0.56, "blue": 0.18}})
             logger.info("Created sheet: %s", TRANSACTIONS_SHEET)
         else:
-            # Добавить колонку "Кошелёк" если отсутствует (миграция)
             ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
             headers = ws.row_values(1)
             if "Кошелёк" not in headers:
                 col = len(headers) + 1
-                # Расширить сетку если нужно
                 if ws.col_count < col:
                     ws.resize(rows=ws.row_count, cols=col)
                 ws.update_cell(1, col, "Кошелёк")
                 logger.info("Added 'Кошелёк' column to %s", TRANSACTIONS_SHEET)
 
-        # ── Кошельки — всегда обновляем при старте ──
         if WALLETS_SHEET not in existing:
             ws = self.spreadsheet.add_worksheet(title=WALLETS_SHEET, rows=20, cols=6)
             logger.info("Created sheet: %s", WALLETS_SHEET)
@@ -115,7 +129,6 @@ class SheetsManager:
                 ws.resize(rows=ws.row_count, cols=6)
         self._populate_wallets(ws)
 
-        # ── Сводка — всегда обновляем формулы при старте ──
         if SUMMARY_SHEET not in existing:
             ws = self.spreadsheet.add_worksheet(title=SUMMARY_SHEET, rows=60, cols=4)
             logger.info("Created sheet: %s", SUMMARY_SHEET)
@@ -129,9 +142,7 @@ class SheetsManager:
         rows: list[list] = [
             ["Карта/Счёт", "Банк", "Нач. баланс (₽)", "Текущий баланс (₽)", "Ставка (%)", "Доход/мес (₽)"]
         ]
-
         for i, (name, initial, rate, bank) in enumerate(INITIAL_WALLETS, start=2):
-            # Текущий баланс = нач.баланс + все операции по этому кошельку
             balance_formula = (
                 f'=C{i}+SUMPRODUCT(({t}!G$2:G$10000="{name}")'
                 f'*(({t}!C$2:C$10000="Доход")-({t}!C$2:C$10000="Расход"))'
@@ -177,7 +188,6 @@ class SheetsManager:
         ]
         for cat in INCOME_CATEGORIES:
             rows.append([cat, f'=SUMIF({t}!D:D;"{cat}";{t}!E:E)', "", ""])
-
         rows.append(["", "", "", ""])
         rows.append(["РАСХОДЫ ПО КАТЕГОРИЯМ", "Сумма (₽)", "", ""])
         for cat in EXPENSE_CATEGORIES:
@@ -187,14 +197,37 @@ class SheetsManager:
         ws.format("A1:D1", {"textFormat": {"bold": True}})
         ws.format("A4:D4", {"textFormat": {"bold": True}})
 
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _row_from_result(result: dict) -> int:
+        try:
+            updated = result["updates"]["updatedRange"]
+            cell = updated.split("!")[1].split(":")[0]
+            return int("".join(c for c in cell if c.isdigit()))
+        except (KeyError, IndexError, ValueError):
+            return -1
+
+    def _get_all_records(self) -> list[dict]:
+        cached, hit = self._cache.get("records")
+        if hit:
+            return cached
+        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
+        records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+        for r in records:
+            if isinstance(r.get("Дата"), (int, float)):
+                r["Дата"] = (_SHEETS_EPOCH + timedelta(days=int(r["Дата"]))).isoformat()
+        self._cache.set("records", records)
+        return records
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def add_transaction(
         self, type_: str, category: str, amount: float, description: str, wallet: str = ""
-    ) -> None:
+    ) -> int:
         ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
         now = datetime.now()
-        ws.append_row(
+        result = ws.append_row(
             [
                 now.strftime("%Y-%m-%d"),
                 now.strftime("%H:%M:%S"),
@@ -206,25 +239,28 @@ class SheetsManager:
             ],
             value_input_option="USER_ENTERED",
         )
+        self._cache.invalidate()
+        return self._row_from_result(result)
 
-    def add_transfer(self, amount: float, from_wallet: str, to_wallet: str, category: str = "") -> None:
+    def add_transfer(self, amount: float, from_wallet: str, to_wallet: str, category: str = "") -> tuple[int, int]:
         ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
-        now  = datetime.now()
-        dt   = now.strftime("%Y-%m-%d")
-        tm   = now.strftime("%H:%M:%S")
+        now = datetime.now()
+        dt  = now.strftime("%Y-%m-%d")
+        tm  = now.strftime("%H:%M:%S")
         cat_suffix = f" [{category}]" if category else ""
-        ws.append_row(
+        r1 = ws.append_row(
             [dt, tm, "Расход", TRANSFER_CATEGORY, amount, f"→ {to_wallet}{cat_suffix}", from_wallet],
             value_input_option="USER_ENTERED",
         )
-        ws.append_row(
+        r2 = ws.append_row(
             [dt, tm, "Доход", TRANSFER_CATEGORY, amount, f"← {from_wallet}{cat_suffix}", to_wallet],
             value_input_option="USER_ENTERED",
         )
+        self._cache.invalidate()
+        return self._row_from_result(r1), self._row_from_result(r2)
 
     def get_balance(self) -> tuple[float, float, float]:
-        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
-        records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+        records = self._get_all_records()
         income = sum(
             float(r["Сумма"]) for r in records
             if r["Тип"] == "Доход" and r["Сумма"] and r.get("Категория") != TRANSFER_CATEGORY
@@ -235,13 +271,10 @@ class SheetsManager:
         )
         return income, expense, income - expense
 
-    def get_recent(self, n: int = 10) -> list[dict]:
-        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
-        records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
-        for r in records:
-            if isinstance(r.get("Дата"), (int, float)):
-                r["Дата"] = (_SHEETS_EPOCH + timedelta(days=int(r["Дата"]))).isoformat()
-        return list(reversed(records[-n:]))
+    def get_recent(self, n: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+        records = self._get_all_records()
+        newest_first = list(reversed(records))
+        return newest_first[offset : offset + n], len(records)
 
     def get_report(
         self,
@@ -249,8 +282,7 @@ class SheetsManager:
         date_to:   date | None = None,
     ) -> tuple[dict[str, float], dict[str, float]]:
         """Доходы и расходы по категориям за период. None = без ограничения."""
-        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
-        records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+        records = self._get_all_records()
         income_by_cat:  dict[str, float] = {}
         expense_by_cat: dict[str, float] = {}
         for r in records:
@@ -271,13 +303,15 @@ class SheetsManager:
         return income_by_cat, expense_by_cat
 
     def get_wallet_names(self) -> list[str]:
-        ws = self.spreadsheet.worksheet(WALLETS_SHEET)
-        values = ws.col_values(1)[1:]  # пропустить заголовок
-        return [v for v in values if v and v != "ИТОГО"]
+        return [name for name, _, _, _ in self.get_wallets()]
 
     def get_wallets(self) -> list[tuple[str, float, float, str]]:
         """Возвращает [(название, баланс, годовая_ставка_%, банк)]."""
-        def _num(val: str) -> float:
+        cached, hit = self._cache.get("wallets")
+        if hit:
+            return cached
+
+        def _num(val) -> float:
             try:
                 return float(str(val).replace(",", ".").replace("\xa0", "").replace(" ", "") or "0")
             except ValueError:
@@ -291,9 +325,10 @@ class SheetsManager:
             if not name or name == "ИТОГО":
                 continue
             bank    = row[1] if len(row) > 1 else ""
-            balance = _num(row[3]) if len(row) > 3 else 0.0   # колонка D
-            rate    = _num(row[4]) if len(row) > 4 else 0.0   # колонка E
+            balance = _num(row[3]) if len(row) > 3 else 0.0
+            rate    = _num(row[4]) if len(row) > 4 else 0.0
             result.append((name, balance, rate, bank))
+        self._cache.set("wallets", result)
         return result
 
     def get_wallets_total(self) -> float:
@@ -305,8 +340,7 @@ class SheetsManager:
         date_to:   date | None = None,
     ) -> dict[str, float]:
         """Возвращает {имя_ученицы: сумма} за период. None = без ограничения."""
-        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
-        records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+        records = self._get_all_records()
         by_student: dict[str, float] = {}
         for r in records:
             if not (r["Тип"] == "Доход" and r["Категория"] == TUTORING_CATEGORY and r["Сумма"]):
@@ -321,3 +355,10 @@ class SheetsManager:
             student = str(r.get("Описание") or "Без имени")
             by_student[student] = by_student.get(student, 0) + float(r["Сумма"])
         return by_student
+
+    def delete_rows(self, rows: list[int]) -> None:
+        ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
+        for row in sorted(rows, reverse=True):
+            if row > 1:
+                ws.delete_rows(row)
+        self._cache.invalidate()

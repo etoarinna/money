@@ -60,7 +60,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ConversationHandler states
 (
     SELECT_TYPE,
     SELECT_CATEGORY,
@@ -77,6 +76,7 @@ logger = logging.getLogger(__name__)
 sheets_mgr: SheetsManager
 
 TYUMEN_TZ = ZoneInfo("Asia/Yekaterinburg")  # UTC+5
+PAGE_SIZE = 10
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,6 +203,38 @@ def _desc_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _format_history_page(
+    records: list[dict], page: int, total: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    lines = ["📋 *Последние записи:*\n"]
+    for r in records:
+        sign   = "+" if r["Тип"] == "Доход" else "-"
+        emoji  = "💰" if r["Тип"] == "Доход" else "💸"
+        amt    = float(r["Сумма"]) if r["Сумма"] else 0
+        wallet = f" · {r['Кошелёк']}" if r.get("Кошелёк") else ""
+        cat    = r["Категория"]
+        desc   = str(r.get("Описание") or "")
+        if cat == TRANSFER_CATEGORY:
+            lines.append(f"🔄 `{r['Дата']}` {desc}: `{_fmt(amt)} ₽`")
+            continue
+        elif cat == TUTORING_CATEGORY and desc:
+            label = f"{cat} ({desc}){wallet}"
+        else:
+            label = f"{cat}{wallet}" + (f" — {desc}" if desc else "")
+        lines.append(f"{emoji} `{r['Дата']}` {label}: `{sign}{_fmt(amt)} ₽`")
+
+    if total > PAGE_SIZE:
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        lines.append(f"\n_Стр. {page + 1} / {pages}_")
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Назад", callback_data=f"history_{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"history_{page + 1}"))
+    return "\n".join(lines), InlineKeyboardMarkup([nav]) if nav else None
+
+
 # ── Голос ─────────────────────────────────────────────────────────────────────
 
 
@@ -247,7 +279,7 @@ async def _save_and_reply(
     amount   = ud["amount"]
     wallet   = ud.get("wallet", "")
 
-    sheets_mgr.add_transaction(type_, category, amount, description, wallet)
+    row_num = sheets_mgr.add_transaction(type_, category, amount, description, wallet)
 
     sign  = "+" if type_ == "Доход" else "-"
     emoji = "💰" if type_ == "Доход" else "💸"
@@ -263,11 +295,16 @@ async def _save_and_reply(
     if description and category != TUTORING_CATEGORY:
         text += f"\n📝 {description}"
 
+    undo_kb = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отменить", callback_data=f"undo_{row_num}")]])
+        if row_num > 0 else None
+    )
+
     context.user_data.clear()
     if update.callback_query:
-        await update.callback_query.edit_message_text(text)
+        await update.callback_query.edit_message_text(text, reply_markup=undo_kb)
     else:
-        await update.message.reply_text(text, reply_markup=MAIN_KB)
+        await update.message.reply_text(text, reply_markup=undo_kb or MAIN_KB)
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -332,7 +369,7 @@ async def cmd_balance(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_history(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        records = sheets_mgr.get_recent(10)
+        records, total = sheets_mgr.get_recent(PAGE_SIZE, offset=0)
     except Exception as exc:
         logger.error("get_recent: %s", exc)
         await update.message.reply_text("⚠️ Ошибка при получении данных.")
@@ -340,28 +377,8 @@ async def cmd_history(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not records:
         await update.message.reply_text("📋 Записей пока нет.")
         return
-
-    lines = ["📋 *Последние записи:*\n"]
-    for r in records:
-        sign    = "+" if r["Тип"] == "Доход" else "-"
-        emoji   = "💰" if r["Тип"] == "Доход" else "💸"
-        amt     = float(r["Сумма"]) if r["Сумма"] else 0
-        wallet  = f" · {r['Кошелёк']}" if r.get("Кошелёк") else ""
-        cat     = r["Категория"]
-        desc    = str(r.get("Описание") or "")
-
-        # Форматирование по типу записи
-        if cat == TRANSFER_CATEGORY:
-            lines.append(f"🔄 `{r['Дата']}` {desc}: `{_fmt(amt)} ₽`")
-            continue
-        elif cat == TUTORING_CATEGORY and desc:
-            label = f"{cat} ({desc}){wallet}"
-        else:
-            label = f"{cat}{wallet}" + (f" — {desc}" if desc else "")
-
-        lines.append(f"{emoji} `{r['Дата']}` {label}: `{sign}{_fmt(amt)} ₽`")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    text, kb = _format_history_page(records, 0, total)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
 async def cmd_report(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -406,6 +423,36 @@ async def on_report_period(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def on_history_page(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    page = int(q.data.removeprefix("history_"))
+    try:
+        records, total = sheets_mgr.get_recent(PAGE_SIZE, offset=page * PAGE_SIZE)
+    except Exception as exc:
+        logger.error("get_recent: %s", exc)
+        await q.edit_message_text("⚠️ Ошибка при получении данных.")
+        return
+    if not records:
+        await q.edit_message_text("📋 Записей пока нет.")
+        return
+    text, kb = _format_history_page(records, page, total)
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_undo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    row_str = q.data.removeprefix("undo_")
+    try:
+        rows = [int(r) for r in row_str.split(",")]
+        sheets_mgr.delete_rows(rows)
+        await q.edit_message_text("↩️ Запись удалена.")
+    except Exception as exc:
+        logger.error("undo: %s", exc)
+        await q.edit_message_text("⚠️ Не удалось удалить запись.")
+
+
 # ── Conversation: вход ────────────────────────────────────────────────────────
 
 
@@ -418,7 +465,6 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         desc   = desc.strip()
         amount = float(amount_str.replace(",", "."))
 
-        # Быстрый ввод с именем ученицы: +1500 Ира
         if sign == "+" and desc in STUDENTS:
             context.user_data.update({
                 "type":       "Доход",
@@ -433,7 +479,6 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return SELECT_WALLET
 
-        # Обычный быстрый ввод
         context.user_data.update({
             "type":       "Доход" if sign == "+" else "Расход",
             "amount":     amount,
@@ -545,12 +590,10 @@ async def on_select_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
     category = q.data.removeprefix("cat_")
     context.user_data["category"] = category
 
-    # Репетиторство — спрашиваем ученицу
     if category == TUTORING_CATEGORY:
         await q.edit_message_text("👩‍🏫 От кого?", reply_markup=_student_kb())
         return SELECT_STUDENT
 
-    # Остальные категории — сразу к кошельку
     wallets = sheets_mgr.get_wallet_names()
     await q.edit_message_text("С какой карты?", reply_markup=_wallet_kb(wallets))
     return SELECT_WALLET
@@ -567,10 +610,8 @@ async def on_select_student(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     student = q.data.removeprefix("student_")
 
     if "quick_desc" in context.user_data:
-        # Быстрый путь (quick input / voice): обновляем описание именем ученицы
         context.user_data["quick_desc"] = student
     else:
-        # Обычный путь: запомним студента, спросим сумму после кошелька
         context.user_data["student"] = student
 
     wallets = sheets_mgr.get_wallet_names()
@@ -592,7 +633,6 @@ async def on_select_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["wallet"] = q.data.removeprefix("wallet_")
 
     if "quick_desc" in context.user_data:
-        # Сумма уже есть — сохраняем
         try:
             await _save_and_reply(update, context, context.user_data.pop("quick_desc", ""))
         except Exception as exc:
@@ -620,7 +660,6 @@ async def on_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data["amount"] = amount
 
-    # Если ученица уже выбрана — сохраняем без вопроса об описании
     if "student" in context.user_data:
         try:
             await _save_and_reply(update, context, context.user_data.pop("student"))
@@ -764,7 +803,7 @@ async def on_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cat    = context.user_data.get("transfer_cat", "")
 
     try:
-        sheets_mgr.add_transfer(amount, from_w, to_w, cat)
+        row1, row2 = sheets_mgr.add_transfer(amount, from_w, to_w, cat)
     except Exception as exc:
         logger.error("add_transfer: %s", exc)
         await update.message.reply_text("⚠️ Не удалось сохранить. Попробуйте ещё раз.")
@@ -772,9 +811,13 @@ async def on_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     cat_line = f"\n🏷 {cat}" if cat else ""
+    undo_kb = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отменить", callback_data=f"undo_{row1},{row2}")]])
+        if row1 > 0 and row2 > 0 else None
+    )
     await update.message.reply_text(
         f"✅ Перевод записан!\n🔄 {from_w} → {to_w}\n{_fmt(amount)} ₽{cat_line}",
-        reply_markup=MAIN_KB,
+        reply_markup=undo_kb or MAIN_KB,
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -796,7 +839,6 @@ def main() -> None:
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Статичные обработчики (выше ConversationHandler)
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_start))
     app.add_handler(MessageHandler(filters.Text(["💳 Кошельки"]), cmd_wallets))
@@ -808,6 +850,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Text(["📊 Отчёт"]),    cmd_report))
     app.add_handler(CommandHandler("report",  cmd_report))
     app.add_handler(CallbackQueryHandler(on_report_period, pattern="^report_"))
+    app.add_handler(CallbackQueryHandler(on_history_page,  pattern="^history_"))
+    app.add_handler(CallbackQueryHandler(on_undo,          pattern="^undo_"))
 
     conv = ConversationHandler(
         per_message=False,
