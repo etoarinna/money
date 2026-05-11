@@ -53,7 +53,8 @@ WALLETS_SHEET = "Кошельки"
 
 TUTORING_CATEGORY  = "Репетиторство"
 TRANSFER_CATEGORY  = "Перевод между картами"
-SAVINGS_WALLET     = "Мои деньги"
+SAVINGS_WALLET         = "Мои деньги"
+TOTAL_EXCLUDED_WALLETS = {"Кредитка долг"}
 
 INCOME_CATEGORIES = [TUTORING_CATEGORY, "Ресницы", "Маркетплейс", "Бабки"]
 EXPENSE_CATEGORIES = [
@@ -348,7 +349,7 @@ class SheetsManager:
         return result
 
     def get_wallets_total(self) -> float:
-        return sum(b for _, b, _, _ in self.get_wallets())
+        return sum(b for name, b, _, _ in self.get_wallets() if name not in TOTAL_EXCLUDED_WALLETS)
 
     def get_tutoring_report(
         self,
