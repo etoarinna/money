@@ -46,8 +46,10 @@ from telegram.ext import (
 
 import config
 from sheets import (
+    CATEGORY_LIMITS,
     EXPENSE_CATEGORIES,
     INCOME_CATEGORIES,
+    SAVINGS_WALLET,
     STUDENTS,
     TRANSFER_CATEGORY,
     TUTORING_CATEGORY,
@@ -295,16 +297,34 @@ async def _save_and_reply(
     if description and category != TUTORING_CATEGORY:
         text += f"\n📝 {description}"
 
-    undo_kb = (
-        InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отменить", callback_data=f"undo_{row_num}")]])
-        if row_num > 0 else None
-    )
+    if type_ == "Расход" and category in CATEGORY_LIMITS:
+        limit = CATEGORY_LIMITS[category]
+        spent = sheets_mgr.get_month_spent(category)
+        if spent >= limit:
+            over = spent - limit
+            text += f"\n\n⚠️ Лимит превышен! {_fmt(spent)}/{_fmt(limit)} ₽ (+{_fmt(over)} ₽)"
+        else:
+            remaining = limit - spent
+            text += f"\n\n📊 {category}: {_fmt(spent)}/{_fmt(limit)} ₽ (осталось {_fmt(remaining)} ₽)"
+
+    buttons = []
+    if row_num > 0:
+        buttons.append([InlineKeyboardButton("↩️ Отменить", callback_data=f"undo_{row_num}")])
+
+    if type_ == "Доход" and category != TRANSFER_CATEGORY and wallet and wallet != SAVINGS_WALLET:
+        savings = round(amount * 0.1, 2)
+        buttons.append([InlineKeyboardButton(
+            f"💰 10% → {SAVINGS_WALLET} ({_fmt(savings)} ₽)",
+            callback_data=f"savings10_{savings}|{wallet}",
+        )])
+
+    kb = InlineKeyboardMarkup(buttons) if buttons else None
 
     context.user_data.clear()
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=undo_kb)
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
     else:
-        await update.message.reply_text(text, reply_markup=undo_kb or MAIN_KB)
+        await update.message.reply_text(text, reply_markup=kb or MAIN_KB)
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -438,6 +458,22 @@ async def on_history_page(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text, kb = _format_history_page(records, page, total)
     await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_savings10(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data.removeprefix("savings10_")
+    amount_str, from_wallet = data.split("|", 1)
+    try:
+        amount = float(amount_str)
+        sheets_mgr.add_transfer(amount, from_wallet, SAVINGS_WALLET)
+        await q.edit_message_text(
+            f"✅ {_fmt(amount)} ₽ отложено в {SAVINGS_WALLET}\n💳 {from_wallet} → {SAVINGS_WALLET}",
+        )
+    except Exception as exc:
+        logger.error("savings10: %s", exc)
+        await q.edit_message_text("⚠️ Не удалось перевести. Используй 🔄 Перевод вручную.")
 
 
 async def on_undo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -852,6 +888,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_report_period, pattern="^report_"))
     app.add_handler(CallbackQueryHandler(on_history_page,  pattern="^history_"))
     app.add_handler(CallbackQueryHandler(on_undo,          pattern="^undo_"))
+    app.add_handler(CallbackQueryHandler(on_savings10,     pattern="^savings10_"))
 
     conv = ConversationHandler(
         per_message=False,

@@ -53,6 +53,7 @@ WALLETS_SHEET = "Кошельки"
 
 TUTORING_CATEGORY  = "Репетиторство"
 TRANSFER_CATEGORY  = "Перевод между картами"
+SAVINGS_WALLET     = "Мои деньги"
 
 INCOME_CATEGORIES = [TUTORING_CATEGORY, "Ресницы", "Маркетплейс", "Бабки"]
 EXPENSE_CATEGORIES = [
@@ -72,16 +73,23 @@ EXPENSE_CATEGORIES = [
     "Прочее",
 ]
 
+CATEGORY_LIMITS: dict[str, float] = {
+    "Кафе и рестораны": 2000.0,
+}
+
 STUDENTS: list[str] = [
     "Ира", "Катя", "Маша", "Тина", "Света", "Надя", "Соня",
 ]
 
 INITIAL_WALLETS: list[tuple[str, float, float, str]] = [
-    ("Сбербанк",           9180.4,   0.0, "Сбербанк"),
-    ("Фонд накопительный", 4682.79,  0.0, "Сбербанк"),
-    ("Тиньков",            -92.23,   0.0, "Тинькофф"),
-    ("Накопилка",          21483.23, 9.0, "Тинькофф"),
-    ("Наличка",            0.0,      0.0, "Наличные"),
+    ("Сбербанк",           9180.4,      0.0, "Сбербанк"),
+    ("Фонд накопительный", 4682.79,     0.0, "Сбербанк"),
+    ("Тиньков",            -92.23,      0.0, "Тинькофф"),
+    ("Накопилка",          21483.23,    9.0, "Тинькофф"),
+    ("Мои деньги",         0.0,         0.0, "Накопления"),
+    ("Кредитка",           17198.91,    0.0, "Кредит"),
+    ("Кредитка долг",      -178111.46,  0.0, "Кредит"),
+    ("Наличка",            0.0,         0.0, "Наличные"),
 ]
 
 TRANSACTIONS_HEADERS = ["Дата", "Время", "Тип", "Категория", "Сумма", "Описание", "Кошелёк"]
@@ -302,6 +310,13 @@ class SheetsManager:
             elif r["Тип"] == "Расход":
                 expense_by_cat[r["Категория"]] = expense_by_cat.get(r["Категория"], 0) + amt
         return income_by_cat, expense_by_cat
+
+    def get_month_spent(self, category: str) -> float:
+        """Total expenses for a category in the current calendar month."""
+        today = date.today()
+        month_start = date(today.year, today.month, 1)
+        _, expense_by_cat = self.get_report(date_from=month_start)
+        return expense_by_cat.get(category, 0.0)
 
     def get_wallet_names(self) -> list[str]:
         return [name for name, _, _, _ in self.get_wallets()]
