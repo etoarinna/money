@@ -54,7 +54,7 @@ WALLETS_SHEET = "Кошельки"
 TUTORING_CATEGORY  = "Репетиторство"
 TRANSFER_CATEGORY  = "Перевод между картами"
 SAVINGS_WALLET         = "Мои деньги"
-TOTAL_EXCLUDED_WALLETS = {"Кредитка долг"}
+TOTAL_EXCLUDED_WALLETS = {"Кредитка долг", "Кредитка"}
 
 INCOME_CATEGORIES = [TUTORING_CATEGORY, "Ресницы", "Маркетплейс", "Бабки"]
 EXPENSE_CATEGORIES = [
@@ -163,7 +163,7 @@ class SheetsManager:
 
         n = len(INITIAL_WALLETS)
         total_row = n + 2
-        rows.append(["ИТОГО", "", f"=SUM(C2:C{n+1})", f"=SUM(D2:D{n+1})", "", f"=SUM(F2:F{n+1})"])
+        rows.append(["ИТОГО", "", f'=SUMIF(B2:B{n+1},"<>Кредит",C2:C{n+1})', f'=SUMIF(B2:B{n+1},"<>Кредит",D2:D{n+1})', "", f'=SUMIF(B2:B{n+1},"<>Кредит",F2:F{n+1})'])
 
         ws.update("A1", rows, value_input_option="USER_ENTERED")
         ws.format("A1:F1", {"textFormat": {"bold": True},
