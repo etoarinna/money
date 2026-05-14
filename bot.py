@@ -457,6 +457,79 @@ async def cmd_report(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _bank_select_kb(banks: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🏦 {b}", callback_data=f"banksel|{b}")] for b in banks]
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_bank_history_page(
+    records: list[dict], bank: str, page: int, total: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    lines = [f"🏦 *{bank}* — история\n"]
+    for r in records:
+        sign  = "+" if r["Тип"] == "Доход" else "-"
+        emoji = "💰" if r["Тип"] == "Доход" else "💸"
+        amt   = float(r["Сумма"]) if r["Сумма"] else 0
+        cat   = r["Категория"]
+        desc  = str(r.get("Описание") or "")
+        wallet = r.get("Кошелёк") or ""
+        if cat == TRANSFER_CATEGORY:
+            lines.append(f"🔄 `{r['Дата']}` {desc}: `{_fmt(amt)} ₽`")
+        elif cat == TUTORING_CATEGORY and desc:
+            lines.append(f"{emoji} `{r['Дата']}` {cat} ({desc}): `{sign}{_fmt(amt)} ₽`")
+        else:
+            label = cat + (f" — {desc}" if desc else "")
+            wallet_label = f" `[{wallet}]`" if wallet else ""
+            lines.append(f"{emoji} `{r['Дата']}`{wallet_label} {label}: `{sign}{_fmt(amt)} ₽`")
+
+    if total > PAGE_SIZE:
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        lines.append(f"\n_Стр. {page + 1} / {pages}_")
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Назад", callback_data=f"bankhist|{bank}|{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"bankhist|{bank}|{page + 1}"))
+    return "\n".join(lines), InlineKeyboardMarkup([nav]) if nav else None
+
+
+async def on_bank_select(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    bank = q.data.split("|", 1)[1]
+    bank_to_wallets = sheets_mgr.get_bank_to_wallets()
+    wallets = set(bank_to_wallets.get(bank, []))
+    try:
+        records, total = sheets_mgr.get_recent_by_wallets(wallets, PAGE_SIZE, offset=0)
+    except Exception as exc:
+        logger.error("bank_history: %s", exc)
+        await q.edit_message_text("⚠️ Ошибка при получении данных.")
+        return
+    if not records:
+        await q.edit_message_text(f"🏦 *{bank}* — записей нет.", parse_mode="Markdown")
+        return
+    text, kb = _format_bank_history_page(records, bank, 0, total)
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_bank_history_page(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    _, bank, page_str = q.data.split("|", 2)
+    page = int(page_str)
+    bank_to_wallets = sheets_mgr.get_bank_to_wallets()
+    wallets = set(bank_to_wallets.get(bank, []))
+    try:
+        records, total = sheets_mgr.get_recent_by_wallets(wallets, PAGE_SIZE, offset=page * PAGE_SIZE)
+    except Exception as exc:
+        logger.error("bank_history_page: %s", exc)
+        await q.edit_message_text("⚠️ Ошибка при получении данных.")
+        return
+    text, kb = _format_bank_history_page(records, bank, page, total)
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
 async def on_report_period(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
@@ -478,19 +551,17 @@ async def on_report_period(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         date_to = today
         label = today.strftime("%B %Y")
     elif q.data == "report_banks":
-        date_from = today.replace(day=1)
-        date_to = today
-        label = today.strftime("%B %Y")
         try:
-            by_wallet = sheets_mgr.get_expenses_by_wallet(date_from, date_to)
-            wallet_to_bank = {name: bank for name, _, _, bank in sheets_mgr.get_wallets()}
+            bank_to_wallets = sheets_mgr.get_bank_to_wallets()
+            banks = list(bank_to_wallets.keys())
         except Exception as exc:
-            logger.error("get_report banks: %s", exc)
+            logger.error("bank_select: %s", exc)
             await q.edit_message_text("⚠️ Ошибка при получении данных.")
             return
         await q.edit_message_text(
-            _build_bank_report(by_wallet, wallet_to_bank, label),
+            "🏦 *Выберите банк:*",
             parse_mode="Markdown",
+            reply_markup=_bank_select_kb(banks),
         )
         return
     else:
@@ -975,11 +1046,13 @@ def main() -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(MessageHandler(filters.Text(["📊 Отчёт"]),    cmd_report))
     app.add_handler(CommandHandler("report",  cmd_report))
-    app.add_handler(CallbackQueryHandler(on_report_period, pattern="^report_"))
-    app.add_handler(CallbackQueryHandler(on_history_page,  pattern="^history_"))
-    app.add_handler(CallbackQueryHandler(on_delete_record, pattern="^delete_"))
-    app.add_handler(CallbackQueryHandler(on_undo,          pattern="^undo_"))
-    app.add_handler(CallbackQueryHandler(on_savings10,     pattern="^savings10_"))
+    app.add_handler(CallbackQueryHandler(on_report_period,   pattern="^report_"))
+    app.add_handler(CallbackQueryHandler(on_history_page,   pattern="^history_"))
+    app.add_handler(CallbackQueryHandler(on_delete_record,  pattern="^delete_"))
+    app.add_handler(CallbackQueryHandler(on_bank_select,    pattern=r"^banksel\|"))
+    app.add_handler(CallbackQueryHandler(on_bank_history_page, pattern=r"^bankhist\|"))
+    app.add_handler(CallbackQueryHandler(on_undo,           pattern="^undo_"))
+    app.add_handler(CallbackQueryHandler(on_savings10,      pattern="^savings10_"))
 
     conv = ConversationHandler(
         per_message=False,

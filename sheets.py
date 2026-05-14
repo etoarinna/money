@@ -374,6 +374,21 @@ class SheetsManager:
             by_student[student] = by_student.get(student, 0) + float(r["Сумма"])
         return by_student
 
+    def get_bank_to_wallets(self) -> dict[str, list[str]]:
+        """Возвращает {банк: [кошелёк1, кошелёк2, ...]}."""
+        result: dict[str, list[str]] = {}
+        for name, _, _, bank in self.get_wallets():
+            result.setdefault(bank, []).append(name)
+        return result
+
+    def get_recent_by_wallets(
+        self, wallets: set[str], n: int = 10, offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """История операций для указанных кошельков (новые первыми)."""
+        records = self._get_all_records()
+        filtered = [r for r in reversed(records) if r.get("Кошелёк") in wallets]
+        return filtered[offset : offset + n], len(filtered)
+
     def get_expenses_by_wallet(
         self,
         date_from: date | None = None,
