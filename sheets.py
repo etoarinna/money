@@ -224,9 +224,10 @@ class SheetsManager:
             return cached
         ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)
         records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
-        for r in records:
+        for i, r in enumerate(records):
             if isinstance(r.get("Дата"), (int, float)):
                 r["Дата"] = (_SHEETS_EPOCH + timedelta(days=int(r["Дата"]))).isoformat()
+            r["_row"] = i + 2  # row 1 is header
         self._cache.set("records", records)
         return records
 
@@ -372,6 +373,32 @@ class SheetsManager:
             student = str(r.get("Описание") or "Без имени")
             by_student[student] = by_student.get(student, 0) + float(r["Сумма"])
         return by_student
+
+    def get_expenses_by_wallet(
+        self,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Расходы по кошелькам {wallet: {category: amount}}."""
+        records = self._get_all_records()
+        by_wallet: dict[str, dict[str, float]] = {}
+        for r in records:
+            if not r["Сумма"] or r["Тип"] != "Расход" or r.get("Категория") == TRANSFER_CATEGORY:
+                continue
+            rec_date = _to_date(r["Дата"])
+            if rec_date is None:
+                continue
+            if date_from and rec_date < date_from:
+                continue
+            if date_to and rec_date > date_to:
+                continue
+            wallet = r.get("Кошелёк") or "Без карты"
+            cat = r["Категория"]
+            amt = float(r["Сумма"])
+            if wallet not in by_wallet:
+                by_wallet[wallet] = {}
+            by_wallet[wallet][cat] = by_wallet[wallet].get(cat, 0) + amt
+        return by_wallet
 
     def delete_rows(self, rows: list[int]) -> None:
         ws = self.spreadsheet.worksheet(TRANSACTIONS_SHEET)

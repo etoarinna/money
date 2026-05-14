@@ -55,6 +55,7 @@ from sheets import (
     TUTORING_CATEGORY,
     SheetsManager,
 )
+from collections import defaultdict
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -151,13 +152,50 @@ def _report_period_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📅 Сегодня",    callback_data="report_today"),
-            InlineKeyboardButton("📅 Эта неделя", callback_data="report_week"),
+            InlineKeyboardButton("📅 Вчера",      callback_data="report_yesterday"),
         ],
         [
+            InlineKeyboardButton("📅 Эта неделя", callback_data="report_week"),
             InlineKeyboardButton("📅 Этот месяц", callback_data="report_month"),
+        ],
+        [
             InlineKeyboardButton("📅 Всё время",  callback_data="report_all"),
+            InlineKeyboardButton("🏦 По банкам",  callback_data="report_banks"),
         ],
     ])
+
+
+def _build_bank_report(
+    by_wallet: dict[str, dict[str, float]],
+    wallet_to_bank: dict[str, str],
+    label: str,
+) -> str:
+    by_bank: dict[str, dict[str, dict[str, float]]] = defaultdict(dict)
+    for wallet, cats in by_wallet.items():
+        bank = wallet_to_bank.get(wallet, wallet)
+        by_bank[bank][wallet] = cats
+
+    lines = [f"🏦 *Расходы по банкам: {label}*\n"]
+    total_all = 0.0
+
+    for bank in sorted(by_bank):
+        wallets = by_bank[bank]
+        bank_total = sum(amt for cats in wallets.values() for amt in cats.values())
+        total_all += bank_total
+        lines.append(f"🏦 *{bank}* — `-{_fmt(bank_total)} ₽`")
+        for wallet in sorted(wallets):
+            cats = wallets[wallet]
+            wallet_total = sum(cats.values())
+            lines.append(f"  💳 *{wallet}:* `-{_fmt(wallet_total)} ₽`")
+            for cat, amt in sorted(cats.items(), key=lambda x: -x[1]):
+                lines.append(f"    {cat}: `-{_fmt(amt)} ₽`")
+        lines.append("")
+
+    if not by_bank:
+        lines.append("За этот период расходов нет.")
+    else:
+        lines.append(f"💸 *Итого: `-{_fmt(total_all)} ₽`*")
+    return "\n".join(lines)
 
 
 def _build_report(
@@ -209,32 +247,43 @@ def _format_history_page(
     records: list[dict], page: int, total: int
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     lines = ["📋 *Последние записи:*\n"]
-    for r in records:
-        sign   = "+" if r["Тип"] == "Доход" else "-"
-        emoji  = "💰" if r["Тип"] == "Доход" else "💸"
-        amt    = float(r["Сумма"]) if r["Сумма"] else 0
-        wallet = f" · {r['Кошелёк']}" if r.get("Кошелёк") else ""
-        cat    = r["Категория"]
-        desc   = str(r.get("Описание") or "")
+    del_buttons: list[InlineKeyboardButton] = []
+    for idx, r in enumerate(records, start=1):
+        sign    = "+" if r["Тип"] == "Доход" else "-"
+        emoji   = "💰" if r["Тип"] == "Доход" else "💸"
+        amt     = float(r["Сумма"]) if r["Сумма"] else 0
+        wallet  = f" · {r['Кошелёк']}" if r.get("Кошелёк") else ""
+        cat     = r["Категория"]
+        desc    = str(r.get("Описание") or "")
+        row_num = r.get("_row", 0)
         if cat == TRANSFER_CATEGORY:
-            lines.append(f"🔄 `{r['Дата']}` {desc}: `{_fmt(amt)} ₽`")
-            continue
+            lines.append(f"🔄 `{idx}.` `{r['Дата']}` {desc}: `{_fmt(amt)} ₽`")
         elif cat == TUTORING_CATEGORY and desc:
             label = f"{cat} ({desc}){wallet}"
+            lines.append(f"{emoji} `{idx}.` `{r['Дата']}` {label}: `{sign}{_fmt(amt)} ₽`")
         else:
             label = f"{cat}{wallet}" + (f" — {desc}" if desc else "")
-        lines.append(f"{emoji} `{r['Дата']}` {label}: `{sign}{_fmt(amt)} ₽`")
+            lines.append(f"{emoji} `{idx}.` `{r['Дата']}` {label}: `{sign}{_fmt(amt)} ₽`")
+        if row_num > 0:
+            del_buttons.append(
+                InlineKeyboardButton(f"🗑{idx}", callback_data=f"delete_{row_num}|{page}")
+            )
 
     if total > PAGE_SIZE:
         pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
         lines.append(f"\n_Стр. {page + 1} / {pages}_")
 
+    rows = []
+    for i in range(0, len(del_buttons), 5):
+        rows.append(del_buttons[i : i + 5])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ Назад", callback_data=f"history_{page - 1}"))
     if (page + 1) * PAGE_SIZE < total:
         nav.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"history_{page + 1}"))
-    return "\n".join(lines), InlineKeyboardMarkup([nav]) if nav else None
+    if nav:
+        rows.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(rows) if rows else None
 
 
 # ── Голос ─────────────────────────────────────────────────────────────────────
@@ -349,7 +398,6 @@ async def cmd_wallets(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("get_wallets: %s", exc)
         await update.message.reply_text("⚠️ Ошибка при получении данных.")
         return
-    from collections import defaultdict
     grouped: dict[str, list] = defaultdict(list)
     for name, bal, rate, bank in wallets:
         grouped[bank].append((name, bal, rate))
@@ -417,6 +465,10 @@ async def on_report_period(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
     if q.data == "report_today":
         date_from = date_to = today
         label = f"Сегодня, {today.strftime('%d.%m.%Y')}"
+    elif q.data == "report_yesterday":
+        yesterday = today - timedelta(days=1)
+        date_from = date_to = yesterday
+        label = f"Вчера, {yesterday.strftime('%d.%m.%Y')}"
     elif q.data == "report_week":
         date_from = today - timedelta(days=today.weekday())
         date_to = today
@@ -425,6 +477,22 @@ async def on_report_period(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         date_from = today.replace(day=1)
         date_to = today
         label = today.strftime("%B %Y")
+    elif q.data == "report_banks":
+        date_from = today.replace(day=1)
+        date_to = today
+        label = today.strftime("%B %Y")
+        try:
+            by_wallet = sheets_mgr.get_expenses_by_wallet(date_from, date_to)
+            wallet_to_bank = {name: bank for name, _, _, bank in sheets_mgr.get_wallets()}
+        except Exception as exc:
+            logger.error("get_report banks: %s", exc)
+            await q.edit_message_text("⚠️ Ошибка при получении данных.")
+            return
+        await q.edit_message_text(
+            _build_bank_report(by_wallet, wallet_to_bank, label),
+            parse_mode="Markdown",
+        )
+        return
     else:
         date_from = date_to = None
         label = "Всё время"
@@ -458,6 +526,28 @@ async def on_history_page(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text, kb = _format_history_page(records, page, total)
     await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_delete_record(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    parts = q.data.removeprefix("delete_").split("|")
+    try:
+        row = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 else 0
+        sheets_mgr.delete_rows([row])
+        await q.answer("✅ Запись удалена")
+        records, total = sheets_mgr.get_recent(PAGE_SIZE, offset=page * PAGE_SIZE)
+        if not records and page > 0:
+            page -= 1
+            records, total = sheets_mgr.get_recent(PAGE_SIZE, offset=page * PAGE_SIZE)
+        if not records:
+            await q.edit_message_text("📋 Записей нет.")
+            return
+        text, kb = _format_history_page(records, page, total)
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception as exc:
+        logger.error("delete_record: %s", exc)
+        await q.answer("⚠️ Не удалось удалить", show_alert=True)
 
 
 async def on_savings10(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -887,6 +977,7 @@ def main() -> None:
     app.add_handler(CommandHandler("report",  cmd_report))
     app.add_handler(CallbackQueryHandler(on_report_period, pattern="^report_"))
     app.add_handler(CallbackQueryHandler(on_history_page,  pattern="^history_"))
+    app.add_handler(CallbackQueryHandler(on_delete_record, pattern="^delete_"))
     app.add_handler(CallbackQueryHandler(on_undo,          pattern="^undo_"))
     app.add_handler(CallbackQueryHandler(on_savings10,     pattern="^savings10_"))
 
